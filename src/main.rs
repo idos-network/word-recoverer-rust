@@ -32,6 +32,10 @@ struct Args {
     #[arg(short = 'i', long, default_value_t = 10)]
     indices: usize,
 
+    /// Position of missing words: "end" (default) or "start"
+    #[arg(short = 'm', long, default_value = "end")]
+    missing_position: String,
+
     /// Number of threads to use (0 = all available)
     #[arg(short, long, default_value_t = 0)]
     threads: usize,
@@ -88,6 +92,15 @@ fn main() -> Result<()> {
 
     println!("Partial phrase: {} words provided", provided_words);
     println!("Missing words: {} detected (assuming {}-word phrase)", missing_count, expected_total_words);
+    
+    // Validate missing position argument
+    let missing_at_start = match args.missing_position.as_str() {
+        "start" => true,
+        "end" => false,
+        _ => return Err(anyhow!("Invalid missing position. Use 'start' or 'end'")),
+    };
+    
+    println!("Missing position: {}", if missing_at_start { "start" } else { "end" });
 
     // Load target addresses
     let addresses_content = fs::read_to_string(&args.addresses)?;
@@ -166,6 +179,8 @@ fn main() -> Result<()> {
         &derivation_paths,
         found.clone(),
         counter.clone(),
+        missing_at_start,
+        expected_total_words,
     );
 
     let elapsed = start_time.elapsed();
@@ -200,6 +215,45 @@ fn recover_with_checksum(
     derivation_paths: &[String],
     found: Arc<AtomicBool>,
     counter: Arc<std::sync::atomic::AtomicUsize>,
+    missing_at_start: bool,
+    total_words: usize,
+) -> Option<(String, String, String)> {
+    if missing_at_start {
+        // Handle missing words at the start
+        recover_with_checksum_at_start(
+            partial_words,
+            word_list,
+            missing_count,
+            target_addresses,
+            derivation_paths,
+            found,
+            counter,
+            total_words,
+        )
+    } else {
+        // Handle missing words at the end (original implementation)
+        recover_with_checksum_at_end(
+            partial_words,
+            word_list,
+            missing_count,
+            target_addresses,
+            derivation_paths,
+            found,
+            counter,
+            total_words,
+        )
+    }
+}
+
+fn recover_with_checksum_at_end(
+    partial_words: &[String],
+    word_list: &[&str],
+    _missing_count: usize,
+    target_addresses: &[String],
+    derivation_paths: &[String],
+    found: Arc<AtomicBool>,
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+    total_words: usize,
 ) -> Option<(String, String, String)> {
     // Convert partial words to indices
     let mut word_indices = Vec::new();
@@ -216,12 +270,14 @@ fn recover_with_checksum(
         }
     }
     
-    let entropy_bits_missing = match missing_count {
-        1 => 3,   // 11 total bits - 8 checksum bits = 3 entropy bits
-        2 => 14,  // 22 total bits - 8 checksum bits = 14 entropy bits
-        3 => 25,  // 33 total bits - 8 checksum bits = 25 entropy bits
-        _ => unreachable!(),
-    };
+    // Calculate entropy bits based on total word count
+    let total_bits = total_words * 11;
+    let checksum_bits = total_bits / 33; // 1 bit of checksum per 32 bits of entropy
+    let entropy_bits = total_bits - checksum_bits;
+    
+    // Calculate missing entropy bits (not including checksum)
+    let provided_bits = partial_words.len() * 11;
+    let entropy_bits_missing = entropy_bits - provided_bits;
     
     let combinations = 1u32 << entropy_bits_missing;
     
@@ -239,10 +295,9 @@ fn recover_with_checksum(
                 full_bits.push((entropy_suffix >> i) & 1 == 1);
             }
             
-            // Now we have 256 bits of entropy for a 24-word phrase
             // Convert to bytes for checksum calculation
             let mut entropy_bytes = Vec::new();
-            for chunk in full_bits.chunks(8).take(32) { // Take 32 bytes = 256 bits
+            for chunk in full_bits.chunks(8).take(entropy_bits / 8) {
                 let mut byte = 0u8;
                 for (i, &bit) in chunk.iter().enumerate() {
                     if bit {
@@ -257,7 +312,7 @@ fn recover_with_checksum(
             hasher.update(&entropy_bytes);
             let hash = hasher.finalize();
             
-            // Take first 8 bits of hash as checksum
+            // Take first N bits of hash as checksum
             let checksum_byte = hash[0];
             
             // Add checksum bits to complete the mnemonic
@@ -265,13 +320,123 @@ fn recover_with_checksum(
             for i in (0..entropy_bits_missing).rev() {
                 complete_bits.push((entropy_suffix >> i) & 1 == 1);
             }
-            for i in (0..8).rev() {
+            for i in (0..checksum_bits).rev() {
                 complete_bits.push((checksum_byte >> i) & 1 == 1);
             }
             
             // Convert complete bits back to word indices
             let mut complete_indices = Vec::new();
-            for chunk in complete_bits.chunks(11).take(24) {
+            for chunk in complete_bits.chunks(11).take(total_words) {
+                let mut index = 0usize;
+                for (i, &bit) in chunk.iter().enumerate() {
+                    if bit {
+                        index |= 1 << (10 - i);
+                    }
+                }
+                complete_indices.push(index);
+            }
+            
+            // Convert indices to words
+            let words: Vec<String> = complete_indices
+                .iter()
+                .map(|&idx| word_list[idx].to_string())
+                .collect();
+            
+            check_phrase(&words, target_addresses, derivation_paths, found.clone(), counter.clone())
+        })
+}
+
+fn recover_with_checksum_at_start(
+    partial_words: &[String],
+    word_list: &[&str],
+    missing_count: usize,
+    target_addresses: &[String],
+    derivation_paths: &[String],
+    found: Arc<AtomicBool>,
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+    total_words: usize,
+) -> Option<(String, String, String)> {
+    // For missing words at start, we still benefit from checksum optimization
+    // The last word contains checksum bits, so we can validate as we go
+    
+    let total_bits = total_words * 11;
+    let checksum_bits = total_bits / 33;
+    let entropy_bits = total_bits - checksum_bits;
+    
+    // Convert partial words to indices
+    let mut partial_indices = Vec::new();
+    for word in partial_words {
+        let index = word_list.iter().position(|&w| w == word).unwrap();
+        partial_indices.push(index);
+    }
+    
+    // Convert partial indices to bits (these are the ending bits)
+    let mut partial_bits = Vec::new();
+    for index in &partial_indices {
+        for i in (0..11).rev() {
+            partial_bits.push((index >> i) & 1 == 1);
+        }
+    }
+    
+    // For missing words at start, we need to try different starting entropy
+    // The total entropy bits = missing_words * 11 bits
+    let missing_bits = missing_count * 11;
+    let combinations = 1u64 << missing_bits;
+    
+    (0..combinations)
+        .into_par_iter()
+        .find_map_any(|start_bits| {
+            if found.load(Ordering::Relaxed) {
+                return None;
+            }
+            
+            // Convert start_bits to bit array
+            let mut starting_bits = Vec::new();
+            for i in (0..missing_bits).rev() {
+                starting_bits.push((start_bits >> i) & 1 == 1);
+            }
+            
+            // Combine starting bits with partial bits
+            let mut complete_bits = starting_bits.clone();
+            complete_bits.extend(&partial_bits);
+            
+            // Extract entropy bits for checksum calculation
+            let mut entropy_bytes = Vec::new();
+            for chunk in complete_bits.chunks(8).take(entropy_bits / 8) {
+                let mut byte = 0u8;
+                for (i, &bit) in chunk.iter().enumerate() {
+                    if bit {
+                        byte |= 1 << (7 - i);
+                    }
+                }
+                entropy_bytes.push(byte);
+            }
+            
+            // Calculate SHA256 checksum
+            let mut hasher = Sha256::new();
+            hasher.update(&entropy_bytes);
+            let hash = hasher.finalize();
+            
+            // Extract checksum bits from hash
+            let checksum_byte = hash[0];
+            let mut expected_checksum_bits = Vec::new();
+            for i in (0..checksum_bits).rev() {
+                expected_checksum_bits.push((checksum_byte >> i) & 1 == 1);
+            }
+            
+            // Check if the last bits of our complete phrase match the expected checksum
+            let actual_checksum_start = entropy_bits;
+            let actual_checksum_bits = &complete_bits[actual_checksum_start..actual_checksum_start + checksum_bits];
+            
+            // If checksum doesn't match, skip this combination
+            if actual_checksum_bits != expected_checksum_bits.as_slice() {
+                counter.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            
+            // Convert complete bits to word indices
+            let mut complete_indices = Vec::new();
+            for chunk in complete_bits.chunks(11).take(total_words) {
                 let mut index = 0usize;
                 for (i, &bit) in chunk.iter().enumerate() {
                     if bit {

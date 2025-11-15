@@ -8,7 +8,8 @@ A blazing fast command-line tool written in Rust for recovering missing BIP39 se
 - **BIP39 checksum optimization** reduces search space by factor of 256
 - **Auto-detects missing words** - no need to specify how many are missing
 - **Auto-checks common derivation paths** - covers Ledger, Trezor, MetaMask patterns
-- Supports recovering 1-3 missing words at the end of a seed phrase
+- **Supports missing words at start or end** - flexible recovery options
+- Supports recovering 1-3 missing words from a seed phrase
 - Multi-address and multi-derivation path support
 - Progress tracking with real-time updates
 - Early exit optimization when match is found
@@ -32,10 +33,11 @@ word-recoverer [OPTIONS] --phrase <PHRASE> --addresses <ADDRESSES>
 
 ### Options
 
-- `-p, --phrase <PHRASE>` - Partial BIP39 seed phrase (missing words at the end)
+- `-p, --phrase <PHRASE>` - Partial BIP39 seed phrase with missing words
 - `-a, --addresses <ADDRESSES>` - File containing target addresses to check against (one per line)
 - `-d, --derivations <DERIVATIONS>` - File containing derivation paths (optional, see defaults below)
 - `-i, --indices <INDICES>` - Number of indices to check for each derivation path pattern (default: 10)
+- `-m, --missing-position <POSITION>` - Position of missing words: "end" (default) or "start"
 - `-t, --threads <THREADS>` - Number of threads to use (0 = all available cores)
 - `-h, --help` - Print help information
 - `-V, --version` - Print version information
@@ -52,16 +54,25 @@ By default, this generates 30 paths (10 indices × 3 patterns). You can customiz
 - `--indices 20`: Generates 60 paths (checks indices 0-19 for each pattern)
 - `--indices 100`: Generates 300 paths (checks indices 0-99 for each pattern)
 
-### Example
+### Examples
 
 ```bash
 # Create an addresses file
 echo "0x6B3AfC1a634387f2694295bF6BA54bfE8700C6f3" > addresses.txt
 
-# Run the recovery (auto-detects 2 missing words)
+# Recover missing words at the END (default)
 ./target/release/word-recoverer \
   --phrase "tower wealth vanish kiwi truck junk reflect laugh shaft dumb delay wrist circle tip reflect shy pond canyon vivid develop arrest sibling" \
   --addresses addresses.txt
+
+# Recover missing words at the START
+./target/release/word-recoverer \
+  --phrase "vanish kiwi truck junk reflect laugh shaft dumb delay wrist circle tip reflect shy pond canyon vivid develop arrest sibling foil hen" \
+  --addresses addresses.txt \
+  --missing-position start
+
+# Both commands will recover the complete phrase:
+# "tower wealth vanish kiwi truck junk reflect laugh shaft dumb delay wrist circle tip reflect shy pond canyon vivid develop arrest sibling foil hen"
 ```
 
 ### Custom Derivation Paths
